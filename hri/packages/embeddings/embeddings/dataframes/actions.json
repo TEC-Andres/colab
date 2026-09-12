@@ -1,0 +1,17 @@
+[
+  { "document": "approach", "context": "household actions" },
+  { "document": "ask", "context": "household actions" },
+  { "document": "count", "context": "household actions" },
+  { "document": "find", "context": "household actions" },
+  { "document": "follow", "context": "household actions" },
+  { "document": "give", "context": "household actions" },
+  { "document": "go", "context": "household actions" },
+  { "document": "grab", "context": "household actions" },
+  { "document": "identify", "context": "household actions" },
+  { "document": "interact", "context": "household actions" },
+  { "document": "open", "context": "household actions" },
+  { "document": "close", "context": "household actions" },
+  { "document": "pick", "context": "household actions" },
+  { "document": "place", "context": "household actions" },
+  { "document": "remember", "context": "household actions" }
+]

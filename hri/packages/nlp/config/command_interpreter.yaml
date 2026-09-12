@@ -1,0 +1,9 @@
+command_interpreter:
+  ros__parameters:
+    speech_command_topic: "/speech/raw_command"
+    publish_command_topic: "/task_manager/commands"
+    temperature: 0.0
+
+    # llama.cpp (rbrgs fine-tuned model)
+    base_url: "http://localhost:11435/v1"
+    model: "rbrgs"

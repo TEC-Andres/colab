@@ -1,0 +1,9 @@
+useful_audio:
+  ros__parameters:
+    debug: False
+    USE_SILERO_VAD: True
+    threshold: REPLACE
+    DISABLE_KWS: False
+    MIN_AUDIO_DURATION: 1.5
+    MAX_AUDIO_DURATION: 10
+    KEYWORD_TOPIC: REPLACE

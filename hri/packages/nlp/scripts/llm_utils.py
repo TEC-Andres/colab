@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+
+"""Miscellanous functions that interact with an LLM."""
+
+import json
+import os
+from datetime import datetime
+from typing import Optional
+
+import pytz
+import rclpy
+import requests
+from nlp.assets.baml_client.sync_client import b
+from nlp.assets.dialogs import (
+    get_is_coherent_dialog,
+    get_previous_command_answer,
+)
+from openai import OpenAI
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+
+from frida_constants.hri_constants import CATEGORIZE_IDK_THRESHOLD, MODEL
+from frida_interfaces.srv import (
+    CommandInterpreter,
+    Grammar,
+    IsCoherent,
+    IsNegative,
+    IsPositive,
+    LLMWrapper,
+)
+
+CURRENT_CONTEXT = """
+Today is {CURRENT_DATE}.
+Your name is FRIDA (Friendly robotic interactive domestic assistant), a domestic assistant developed by RoBorregos.
+RoBorregos is the representative Robotic team from Tec de Monterrey, Campus Monterrey. It has around 40 members.
+You compete in the Robocup@home competition. Last summer you competed in the Netherlands, at the international competition. Last March you competed in TMR, obtaining 2nd place in Mexico.
+"""
+
+
+CURRENT_FILE_PATH = os.path.abspath(__file__)
+
+FILE_DIR = CURRENT_FILE_PATH[: CURRENT_FILE_PATH.index("install")]
+ASSETS_DIR = os.path.join(
+    FILE_DIR, "src", "hri", "packages", "nlp", "assets", "is_positive_negative"
+)
+
+IS_POSITIVE_MODEL_NAME = "tasksource/deberta-small-long-nli"
+
+
+def get_context():
+    timezone = pytz.timezone("America/Mexico_City")
+    current_date = datetime.now(timezone).strftime("%Y-%m-%d %H:%M:%S")
+    return CURRENT_CONTEXT.format(CURRENT_DATE=current_date)
+
+
+class LLMUtils(Node):
+    base_url: Optional[str]
+
+    def __init__(self) -> None:
+        super().__init__("llm_utils")
+        self.logger = self.get_logger()
+        self.logger.info("Initializing llm_utils node")
+
+        self.declare_parameter("base_url", "None")
+        self.declare_parameter("GRAMMAR_SERVICE", "/nlp/grammar")
+        self.declare_parameter("LLM_WRAPPER_SERVICE", "/nlp/llm")
+        self.declare_parameter("IS_COHERENT_SERVICE", "/nlp/is_coherent")
+        self.declare_parameter("IS_POSITIVE_SERVICE", "/nlp/is_positive")
+        self.declare_parameter("IS_NEGATIVE_SERVICE", "/nlp/is_negative")
+        self.declare_parameter(
+            "COMMAND_INTERPRETER_SERVICE", "/nlp/command_interpreter"
+        )
+
+        self.declare_parameter("temperature", 0.5)
+        base_url = self.get_parameter("base_url").get_parameter_value().string_value
+
+        if base_url == "None":
+            base_url = None
+
+        self.client = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY", "ollama"), base_url=base_url
+        )
+        self.temperature = (
+            self.get_parameter("temperature").get_parameter_value().double_value
+        )
+
+        grammar_service = (
+            self.get_parameter("GRAMMAR_SERVICE").get_parameter_value().string_value
+        )
+
+        llm_wrapper_service = (
+            self.get_parameter("LLM_WRAPPER_SERVICE").get_parameter_value().string_value
+        )
+
+        is_coherent_service = (
+            self.get_parameter("IS_COHERENT_SERVICE").get_parameter_value().string_value
+        )
+        is_positive_service = (
+            self.get_parameter("IS_POSITIVE_SERVICE").get_parameter_value().string_value
+        )
+        is_negative_service = (
+            self.get_parameter("IS_NEGATIVE_SERVICE").get_parameter_value().string_value
+        )
+
+        command_interpreter_service = (
+            self.get_parameter("COMMAND_INTERPRETER_SERVICE")
+            .get_parameter_value()
+            .string_value
+        )
+
+        if not os.path.exists(ASSETS_DIR):
+            self.logger.info(
+                f"Downloading {IS_POSITIVE_MODEL_NAME} to a local directory. This may take a while."
+            )
+
+            self.classifier = pipeline(
+                "zero-shot-classification", model=IS_POSITIVE_MODEL_NAME
+            )
+            self.classifier.model.save_pretrained(ASSETS_DIR)
+            self.classifier.tokenizer.save_pretrained(ASSETS_DIR)
+        else:
+            self.logger.info(
+                f"Loading {IS_POSITIVE_MODEL_NAME} from local directory..."
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(ASSETS_DIR)
+            model = AutoModelForSequenceClassification.from_pretrained(ASSETS_DIR)
+            self.classifier = pipeline(
+                "zero-shot-classification", model=model, tokenizer=tokenizer
+            )
+        self.candidate_labels = ["yes", "no", "i don't know"]
+
+        self.create_service(Grammar, grammar_service, self.grammar_service)
+
+        self.create_service(LLMWrapper, llm_wrapper_service, self.llm_wrapper_service)
+
+        self.create_service(IsPositive, is_positive_service, self.is_positive)
+        self.create_service(IsNegative, is_negative_service, self.is_negative)
+        self.create_service(
+            IsCoherent, is_coherent_service, self.is_coherent_service_callback
+        )
+
+        self.create_service(
+            CommandInterpreter, command_interpreter_service, self.command_interpreter
+        )
+
+        self.logger.info("Initialized llm_utils node")
+
+    def grammar_service(self, req, res):
+        response = (
+            self.client.beta.chat.completions.parse(
+                model=MODEL.GRAMMAR.value,
+                temperature=self.temperature,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You will be presented with some text. Your task is to fix the grammar so that the text is correct. Output ONLY the corrected text, don't include any additional explanations.",
+                    },
+                    {"role": "user", "content": req.text},
+                ],
+            )
+            .choices[0]
+            .message.content
+        )
+
+        res.corrected_text = response
+        return res
+
+    def llm_wrapper_service(self, req, res):
+        context = req.context
+        question = req.question
+
+        messages = get_previous_command_answer(context, question)
+
+        response = (
+            self.client.beta.chat.completions.parse(
+                model=MODEL.LLM_WRAPPER.value,
+                temperature=self.temperature,
+                messages=messages,
+            )
+            .choices[0]
+            .message.content
+        )
+
+        if "</think>" in response:
+            response = response.split("</think>")[-1].strip()
+
+        res.answer = response
+        return res
+
+    def is_coherent_service_callback(self, req, res):
+        self.logger.info(f"Checking coherence for: {req.text}")
+        dialog = get_is_coherent_dialog(req.text)
+        response = (
+            self.client.beta.chat.completions.parse(
+                model=MODEL.LLM_WRAPPER.value,
+                temperature=self.temperature,
+                messages=dialog["messages"],
+                response_format=dialog["response_format"],
+            )
+            .choices[0]
+            .message.content
+        )
+        self.logger.info(f"Coherence result: {response}")
+        try:
+            res.is_coherent = json.loads(response)["is_coherent"]
+        except Exception as e:
+            self.logger.error(f"Failed to parse coherence response: {e}")
+            res.is_coherent = False
+        return res
+
+    def generic_structured_output(self, messages, response_format):
+        self.get_logger().info("Generating structured output")
+        response = (
+            self.client.beta.chat.completions.parse(
+                model=MODEL.GENERIC_STRUCTURED_OUTPUT.value,
+                temperature=self.temperature,
+                messages=messages,
+                response_format=response_format,
+            )
+            .choices[0]
+            .message.content
+        )
+        self.get_logger().info(f"Response: {response}")
+        try:
+            response_data = json.loads(response)
+            result = response_format(**response_data)
+        except Exception as e:
+            self.get_logger().error(f"Service error: {e}")
+            raise rclpy.exceptions.ServiceException(str(e))
+        return result
+
+    def is_positive(
+        self, request: IsPositive.Request, response: IsPositive.Response
+    ) -> IsPositive.Response:
+        """Service to see if text is positive."""
+        self.get_logger().info("Determining if text is positive")
+        try:
+            if len(request.text.strip()) < 1:
+                result = ""
+            else:
+                result = self.get_most_likely_label(request.text)
+        except Exception as e:
+            result = ""
+            self.get_logger().warn(f"Error: {str(e)}")
+
+        response.is_positive = result == "yes"
+        self.get_logger().info(f"The text is positive: {response.is_positive}")
+
+        return response
+
+    def is_negative(
+        self, request: IsNegative.Request, response: IsNegative.Response
+    ) -> IsNegative.Response:
+        """Service to see if text is negative."""
+        self.get_logger().info("Determining if text is negative")
+
+        try:
+            if len(request.text.strip()) < 1:
+                result = ""
+            else:
+                result = self.get_most_likely_label(request.text)
+        except Exception as e:
+            result = ""
+            self.get_logger().warn(f"Error: {str(e)}")
+
+        response.is_negative = result == "no"
+        self.get_logger().info(f"The text is negative: {response.is_negative}")
+        return response
+
+    def get_most_likely_label(self, text):
+        """Get the most likely label for a given text."""
+        result = self.classifier(text, self.candidate_labels)
+
+        self.get_logger().info(f"Classification result: {str(result)}")
+
+        scores = result["scores"]
+        labels = result["labels"]
+
+        # Get the index of the maximum score
+        max_index = scores.index(max(scores))
+        max_label = labels[max_index]
+        idk_index = labels.index("i don't know")
+        if (max_label == "yes" or max_label == "no") and (
+            (scores[max_index] - scores[idk_index]) < CATEGORIZE_IDK_THRESHOLD
+        ):
+            return "i don't know"
+        return max_label
+
+    def command_interpreter(
+        self, request: CommandInterpreter.Request, response: CommandInterpreter.Response
+    ) -> CommandInterpreter.Response:
+        """Service to interpret a command."""
+        req = b.request.GenerateCommandList(request=request.text)
+        res = requests.post(req.url, headers=req.headers, json=req.body.json())
+
+        if res.status_code != 200:
+            self.get_logger().error(f"Error in command_interpreter: {res.text}")
+            raise rclpy.exceptions.ServiceException(res.text)
+        try:
+            res_text = res.json()["choices"][0]["message"]["content"]
+            response.unparsed_response = res_text
+
+            self.get_logger().info(
+                f"Unparsed Command list: {response.unparsed_response}"
+            )
+            return response
+        except json.JSONDecodeError as e:
+            self.get_logger().error(f"Error decoding JSON: {e}")
+            raise rclpy.exceptions.ServiceException(f"Error decoding JSON: {e}")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    try:
+        rclpy.spin(LLMUtils())
+    except (ExternalShutdownException, KeyboardInterrupt):
+        pass
+    finally:
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+respeaker:
+  ros__parameters:
+    RESPEAKER_LIGHT_TOPIC: REPLACE
+    doa_timer: 0.5
+    RESPEAKER_DOA_TOPIC: REPLACE
